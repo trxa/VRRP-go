@@ -1,7 +1,6 @@
-package VRRP
+package vrrp
 
 import (
-	"net"
 	"time"
 )
 
@@ -27,46 +26,38 @@ func (v VRRPVersion) String() string {
 }
 
 const (
-	IPv4 = 4
-	IPv6 = 6
+	stateInit = iota
+	stateMaster
+	stateBackup
 )
 
 const (
-	INIT = iota
-	MASTER
-	BACKUP
+	vrrpTTL              = 255
+	vrrpIPProtocolNumber = 112
 )
+
+type event byte
 
 const (
-	VRRPMultiTTL         = 255
-	VRRPIPProtocolNumber = 112
+	eventShutdown event = iota
+	eventStart
 )
 
-var VRRPMultiAddrIPv4 = net.IPv4(224, 0, 0, 18)
-var VRRPMultiAddrIPv6 = net.ParseIP("FF02:0:0:0:0:0:0:12")
-
-var BaordcastHADDR, _ = net.ParseMAC("ff:ff:ff:ff:ff:ff")
-
-type EVENT byte
-
-const (
-	SHUTDOWN EVENT = iota
-	START
-)
-
-func (e EVENT) String() string {
+func (e event) String() string {
 	switch e {
-	case START:
+	case eventStart:
 		return "START"
-	case SHUTDOWN:
+	case eventShutdown:
 		return "SHUTDOWN"
 	default:
 		return "unknown event"
 	}
 }
 
-const PACKETQUEUESIZE = 1000
-const EVENTCHANNELSIZE = 1
+const (
+	packetQueueSize  = 1000
+	eventChannelSize = 1
+)
 
 type transition int
 
@@ -99,7 +90,7 @@ const (
 )
 
 var (
-	defaultPreempt                    = true
+	defaultPreempt                    = false
 	defaultPriority              byte = 100
 	defaultAdvertisementInterval      = 1 * time.Second
 )

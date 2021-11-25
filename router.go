@@ -1,10 +1,12 @@
-package VRRP
+package vrrp
 
 import (
-	"VRRP/logger"
 	"fmt"
+	"io"
 	"net"
 	"time"
+
+	"github.com/trxa/VRRP-go/logger"
 )
 
 type VirtualRouter struct {
@@ -16,17 +18,13 @@ type VirtualRouter struct {
 	masterDownInterval            uint16
 	preempt                       bool
 	owner                         bool
-	virtualRouterMACAddressIPv4   net.HardwareAddr
-	virtualRouterMACAddressIPv6   net.HardwareAddr
+	peers                         []net.IP
 	//
-	netInterface        *net.Interface
-	ipvX                byte
-	preferredSourceIP   net.IP
-	protectedIPaddrs    map[[16]byte]bool
+	sourceIP            net.IP
+	protectedIPaddrs    map[[4]byte]bool
 	state               int
-	iplayerInterface    IPConnection
-	ipAddrAnnouncer     AddrAnnouncer
-	eventChannel        chan EVENT
+	iplayerInterface    ipConnection
+	eventChannel        chan event
 	packetQueue         chan *VRRPPacket
 	advertisementTicker *time.Ticker
 	masterDownTimer     *time.Timer
@@ -34,88 +32,67 @@ type VirtualRouter struct {
 }
 
 //NewVirtualRouter create a new virtual router with designated parameters
-func NewVirtualRouter(VRID byte, nif string, Owner bool, IPvX byte) *VirtualRouter {
-	if IPvX != IPv4 && IPvX != IPv6 {
-		logger.GLoger.Printf(logger.FATAL, "NewVirtualRouter: parameter IPvx must be IPv4 or IPv6")
-	}
+func NewVirtualRouter(vrID byte, sip net.IP, owner bool) *VirtualRouter {
 	var vr = &VirtualRouter{}
-	vr.vrID = VRID
-	vr.virtualRouterMACAddressIPv4, _ = net.ParseMAC(fmt.Sprintf("00-00-5E-00-01-%X", VRID))
-	vr.virtualRouterMACAddressIPv6, _ = net.ParseMAC(fmt.Sprintf("00-00-5E-00-02-%X", VRID))
-	vr.owner = Owner
+	vr.vrID = vrID
+	vr.owner = owner
 	//default values that defined by RFC 5798
-	if Owner {
+	if owner {
 		vr.priority = 255
 	}
-	vr.state = INIT
+	vr.state = stateInit
 	vr.preempt = defaultPreempt
 	vr.SetAdvInterval(defaultAdvertisementInterval)
 	vr.SetPriorityAndMasterAdvInterval(defaultPriority, defaultAdvertisementInterval)
 
 	//make
-	vr.protectedIPaddrs = make(map[[16]byte]bool)
-	vr.eventChannel = make(chan EVENT, EVENTCHANNELSIZE)
-	vr.packetQueue = make(chan *VRRPPacket, PACKETQUEUESIZE)
+	vr.protectedIPaddrs = make(map[[4]byte]bool)
+	vr.eventChannel = make(chan event, eventChannelSize)
+	vr.packetQueue = make(chan *VRRPPacket, packetQueueSize)
 	vr.transitionHandler = make(map[transition]func())
+	vr.sourceIP = sip
 
-	vr.ipvX = IPvX
-	var NetworkInterface, errOfGetIF = net.InterfaceByName(nif)
-	if errOfGetIF != nil {
-		logger.GLoger.Printf(logger.FATAL, "NewVirtualRouter: %v", errOfGetIF)
-	}
-	vr.netInterface = NetworkInterface
-	//find preferred local IP address
-	if preferred, errOfGetPreferred := findIPbyInterface(NetworkInterface, IPvX); errOfGetPreferred != nil {
-		logger.GLoger.Printf(logger.FATAL, "NewVirtualRouter: %v", errOfGetPreferred)
-	} else {
-		vr.preferredSourceIP = preferred
-	}
-	if IPvX == IPv4 {
-		//set up ARP client
-		vr.ipAddrAnnouncer = NewIPv4AddrAnnouncer(NetworkInterface)
-		//set up IPv4 interface
-		vr.iplayerInterface = NewIPv4Conn(vr.preferredSourceIP, VRRPMultiAddrIPv4)
-	} else {
-		//set up ND client
-		vr.ipAddrAnnouncer = NewIPIPv6AddrAnnouncer(NetworkInterface)
-		//set up IPv6 interface
-		vr.iplayerInterface = NewIPv6Con(vr.preferredSourceIP, VRRPMultiAddrIPv6)
-	}
-	logger.GLoger.Printf(logger.INFO, "virtual router %v initialized, working on %v", VRID, nif)
+	//set up IPv4 interface
+	vr.iplayerInterface = newIPv4Conn(vr.sourceIP)
+	logger.GLoger.Printf(logger.INFO, "virtual router %v initialized, working on %v", vrID, sip)
 	return vr
 
 }
 
-func (r *VirtualRouter) setPriority(Priority byte) *VirtualRouter {
-	if r.owner {
-		return r
-	}
-	r.priority = Priority
+func (r *VirtualRouter) SetPeers(peers ...net.IP) *VirtualRouter {
+	r.peers = append([]net.IP(nil), peers...)
 	return r
 }
 
-func (r *VirtualRouter) SetAdvInterval(Interval time.Duration) *VirtualRouter {
-	if Interval < 10*time.Millisecond {
+func (r *VirtualRouter) setPriority(priority byte) *VirtualRouter {
+	if r.owner {
+		return r
+	}
+	r.priority = priority
+	return r
+}
+
+func (r *VirtualRouter) SetAdvInterval(interval time.Duration) *VirtualRouter {
+	if interval < 10*time.Millisecond {
 		panic("interval can not less than 10 ms")
 	}
-	r.advertisementInterval = uint16(Interval / (10 * time.Millisecond))
+	r.advertisementInterval = uint16(interval / (10 * time.Millisecond))
 	return r
 }
 
 func (r *VirtualRouter) SetPriorityAndMasterAdvInterval(priority byte, interval time.Duration) *VirtualRouter {
 	r.setPriority(priority)
 	if interval < 10*time.Millisecond {
-		panic("interval can not less than 10 ms")
+		panic("interval can not be less than 10 ms")
 	}
 	r.setMasterAdvInterval(uint16(interval / (10 * time.Millisecond)))
 	return r
 }
 
-func (r *VirtualRouter) setMasterAdvInterval(Interval uint16) *VirtualRouter {
-	r.advertisementIntervalOfMaster = Interval
+func (r *VirtualRouter) setMasterAdvInterval(interval uint16) *VirtualRouter {
+	r.advertisementIntervalOfMaster = interval
 	r.skewTime = r.advertisementIntervalOfMaster - uint16(float32(r.advertisementIntervalOfMaster)*float32(r.priority)/256)
 	r.masterDownInterval = 3*r.advertisementIntervalOfMaster + r.skewTime
-	//从MasterDownInterval和SkewTime的计算方式来看，同一组VirtualRouter中，Priority越高的Router越快地认为某个Master失效
 	return r
 }
 
@@ -125,7 +102,7 @@ func (r *VirtualRouter) SetPreemptMode(flag bool) *VirtualRouter {
 }
 
 func (r *VirtualRouter) AddIPvXAddr(ip net.IP) {
-	var key [16]byte
+	var key [4]byte
 	copy(key[:], ip)
 	if _, ok := r.protectedIPaddrs[key]; ok {
 		logger.GLoger.Printf(logger.ERROR, "VirtualRouter.AddIPvXAddr: add redundant IP addr %v", ip)
@@ -135,7 +112,7 @@ func (r *VirtualRouter) AddIPvXAddr(ip net.IP) {
 }
 
 func (r *VirtualRouter) RemoveIPvXAddr(ip net.IP) {
-	var key [16]byte
+	var key [4]byte
 	copy(key[:], ip)
 	if _, ok := r.protectedIPaddrs[key]; ok {
 		delete(r.protectedIPaddrs, key)
@@ -149,15 +126,16 @@ func (r *VirtualRouter) sendAdvertMessage() {
 	for k := range r.protectedIPaddrs {
 		logger.GLoger.Printf(logger.DEBUG, "send advert message of IP %v", net.IP(k[:]))
 	}
-	var x = r.assembleVRRPPacket()
-	if errOfWrite := r.iplayerInterface.WriteMessage(x); errOfWrite != nil {
-		logger.GLoger.Printf(logger.ERROR, "VirtualRouter.WriteMessage: %v", errOfWrite)
+	for _, p := range r.peers {
+		var x = r.assembleVRRPPacket(p)
+		if errOfWrite := r.iplayerInterface.WriteMessage(x, p); errOfWrite != nil {
+			logger.GLoger.Printf(logger.ERROR, "VirtualRouter.WriteMessage: %v", errOfWrite)
+		}
 	}
 }
 
 //assembleVRRPPacket assemble VRRP advert packet
-func (r *VirtualRouter) assembleVRRPPacket() *VRRPPacket {
-
+func (r *VirtualRouter) assembleVRRPPacket(daddr net.IP) *VRRPPacket {
 	var packet VRRPPacket
 	packet.SetPriority(r.priority)
 	packet.SetVersion(VRRPv3)
@@ -165,17 +143,13 @@ func (r *VirtualRouter) assembleVRRPPacket() *VRRPPacket {
 	packet.SetAdvertisementInterval(r.advertisementInterval)
 	packet.SetType()
 	for k := range r.protectedIPaddrs {
-		packet.AddIPvXAddr(r.ipvX, net.IP(k[:]))
+		packet.AddIPvXAddr(net.IP(k[:]))
 	}
 	var pshdr PseudoHeader
-	pshdr.Protocol = VRRPIPProtocolNumber
-	if r.ipvX == IPv4 {
-		pshdr.Daddr = VRRPMultiAddrIPv4
-	} else {
-		pshdr.Daddr = VRRPMultiAddrIPv6
-	}
+	pshdr.Protocol = vrrpIPProtocolNumber
+	pshdr.Daddr = daddr
 	pshdr.Len = uint16(len(packet.ToBytes()))
-	pshdr.Saddr = r.preferredSourceIP
+	pshdr.Saddr = r.sourceIP
 	packet.SetCheckSum(&pshdr)
 	return &packet
 }
@@ -184,7 +158,10 @@ func (r *VirtualRouter) assembleVRRPPacket() *VRRPPacket {
 func (r *VirtualRouter) fetchVRRPPacket() {
 	for {
 		if packet, errofFetch := r.iplayerInterface.ReadMessage(); errofFetch != nil {
-			logger.GLoger.Printf(logger.ERROR, "VirtualRouter.fetchVRRPPacket: %v", errofFetch)
+			logger.GLoger.Printf(logger.INFO, "VirtualRouter.fetchVRRPPacket: %v", errofFetch)
+			if errofFetch == io.EOF {
+				return
+			}
 		} else {
 			if r.vrID == packet.GetVirtualRouterID() {
 				r.packetQueue <- packet
@@ -275,38 +252,36 @@ func largerThan(ip1, ip2 net.IP) bool {
 func (r *VirtualRouter) eventLoop() {
 	for {
 		switch r.state {
-		case INIT:
+		case stateInit:
 			select {
 			case event := <-r.eventChannel:
-				if event == START {
+				switch event {
+				case eventStart:
 					logger.GLoger.Printf(logger.INFO, "event %v received", event)
 					if r.priority == 255 || r.owner {
 						logger.GLoger.Printf(logger.INFO, "enter owner mode")
 						r.sendAdvertMessage()
-						if errOfarp := r.ipAddrAnnouncer.AnnounceAll(r); errOfarp != nil {
-							logger.GLoger.Printf(logger.ERROR, "VirtualRouter.EventLoop: %v", errOfarp)
-						}
 						//set up advertisement timer
 						r.makeAdvertTicker()
-						logger.GLoger.Printf(logger.DEBUG, "enter MASTER state")
-						r.state = MASTER
+						logger.GLoger.Printf(logger.DEBUG, "enter stateMaster state")
+						r.state = stateMaster
 						r.transitionDoWork(Init2Master)
 					} else {
 						logger.GLoger.Printf(logger.INFO, "VR is not the owner of protected IP addresses")
 						r.setMasterAdvInterval(r.advertisementInterval)
 						//set up master down timer
 						r.makeMasterDownTimer()
-						logger.GLoger.Printf(logger.DEBUG, "enter BACKUP state")
-						r.state = BACKUP
+						logger.GLoger.Printf(logger.DEBUG, "enter stateBackup state")
+						r.state = stateBackup
 						r.transitionDoWork(Init2Backup)
 					}
 				}
 			}
-		case MASTER:
+		case stateMaster:
 			//check if shutdown event received
 			select {
 			case event := <-r.eventChannel:
-				if event == SHUTDOWN {
+				if event == eventShutdown {
 					//close advert timer
 					r.stopAdvertTicker()
 					//send advertisement with priority 0
@@ -314,8 +289,8 @@ func (r *VirtualRouter) eventLoop() {
 					r.setPriority(0)
 					r.sendAdvertMessage()
 					r.setPriority(priority)
-					//transition into INIT
-					r.state = INIT
+					//transition into stateInit
+					r.state = stateInit
 					r.transitionDoWork(Master2Init)
 					logger.GLoger.Printf(logger.INFO, "event %v received", event)
 					//maybe we can break out the event loop
@@ -331,14 +306,14 @@ func (r *VirtualRouter) eventLoop() {
 				if packet.GetPriority() == 0 {
 					//I don't think we should anything here
 				} else {
-					if packet.GetPriority() > r.priority || (packet.GetPriority() == r.priority && largerThan(packet.Pshdr.Saddr, r.preferredSourceIP)) {
+					if packet.GetPriority() > r.priority || (packet.GetPriority() == r.priority && largerThan(packet.Pshdr.Saddr, r.sourceIP)) {
 
 						//cancel Advertisement timer
 						r.stopAdvertTicker()
 						//set up master down timer
 						r.setMasterAdvInterval(packet.GetAdvertisementInterval())
 						r.makeMasterDownTimer()
-						r.state = BACKUP
+						r.state = stateBackup
 						r.transitionDoWork(Master2Backup)
 					} else {
 						//just discard this one
@@ -347,14 +322,14 @@ func (r *VirtualRouter) eventLoop() {
 			default:
 				//nothing to do
 			}
-		case BACKUP:
+		case stateBackup:
 			select {
 			case event := <-r.eventChannel:
-				if event == SHUTDOWN {
+				if event == eventShutdown {
 					//close master down timer
 					r.stopMasterDownTimer()
-					//transition into INIT
-					r.state = INIT
+					//transition into stateInit
+					r.state = stateInit
 					r.transitionDoWork(Backup2Init)
 					logger.GLoger.Printf(logger.INFO, "event %s received", event)
 				}
@@ -364,11 +339,11 @@ func (r *VirtualRouter) eventLoop() {
 			select {
 			case packet := <-r.packetQueue:
 				if packet.GetPriority() == 0 {
-					logger.GLoger.Printf(logger.INFO, "received an advertisement with priority 0, transit into MASTER state", r.vrID)
+					logger.GLoger.Printf(logger.INFO, "received an advertisement with priority 0, transit into stateMaster state", r.vrID)
 					//Set the Master_Down_Timer to Skew_Time
 					r.resetMasterDownTimerToSkewTime()
 				} else {
-					if r.preempt == false || packet.GetPriority() > r.priority || (packet.GetPriority() == r.priority && largerThan(packet.Pshdr.Saddr, r.preferredSourceIP)) {
+					if r.preempt == false || packet.GetPriority() > r.priority || (packet.GetPriority() == r.priority && largerThan(packet.Pshdr.Saddr, r.sourceIP)) {
 						//reset master down timer
 						r.setMasterAdvInterval(packet.GetAdvertisementInterval())
 						r.resetMasterDownTimer()
@@ -384,18 +359,13 @@ func (r *VirtualRouter) eventLoop() {
 			case <-r.masterDownTimer.C:
 				// Send an ADVERTISEMENT
 				r.sendAdvertMessage()
-				if errOfARP := r.ipAddrAnnouncer.AnnounceAll(r); errOfARP != nil {
-					logger.GLoger.Printf(logger.ERROR, "VirtualRouter.EventLoop: %v", errOfARP)
-				}
 				//Set the Advertisement Timer to Advertisement interval
 				r.makeAdvertTicker()
-
-				r.state = MASTER
+				r.state = stateMaster
 				r.transitionDoWork(Backup2Master)
 			default:
 				//nothing to do
 			}
-
 		}
 	}
 }
@@ -404,39 +374,36 @@ func (r *VirtualRouter) eventLoop() {
 func (r *VirtualRouter) eventSelector() {
 	for {
 		switch r.state {
-		case INIT:
+		case stateInit:
 			select {
 			case event := <-r.eventChannel:
-				if event == START {
+				switch event {
+				case eventStart:
 					logger.GLoger.Printf(logger.INFO, "event %v received", event)
 					if r.priority == 255 || r.owner {
 						logger.GLoger.Printf(logger.INFO, "enter owner mode")
 						r.sendAdvertMessage()
-						if errOfarp := r.ipAddrAnnouncer.AnnounceAll(r); errOfarp != nil {
-							logger.GLoger.Printf(logger.ERROR, "VirtualRouter.EventLoop: %v", errOfarp)
-						}
 						//set up advertisement timer
 						r.makeAdvertTicker()
-
-						logger.GLoger.Printf(logger.DEBUG, "enter MASTER state")
-						r.state = MASTER
+						logger.GLoger.Printf(logger.DEBUG, "enter stateMaster state")
+						r.state = stateMaster
 						r.transitionDoWork(Init2Master)
 					} else {
 						logger.GLoger.Printf(logger.INFO, "VR is not the owner of protected IP addresses")
 						r.setMasterAdvInterval(r.advertisementInterval)
 						//set up master down timer
 						r.makeMasterDownTimer()
-						logger.GLoger.Printf(logger.DEBUG, "enter BACKUP state")
-						r.state = BACKUP
+						logger.GLoger.Printf(logger.DEBUG, "enter stateBackup state")
+						r.state = stateBackup
 						r.transitionDoWork(Init2Backup)
 					}
 				}
 			}
-		case MASTER:
+		case stateMaster:
 			//check if shutdown event received
 			select {
 			case event := <-r.eventChannel:
-				if event == SHUTDOWN {
+				if event == eventShutdown {
 					//close advert timer
 					r.stopAdvertTicker()
 					//send advertisement with priority 0
@@ -444,8 +411,8 @@ func (r *VirtualRouter) eventSelector() {
 					r.setPriority(0)
 					r.sendAdvertMessage()
 					r.setPriority(priority)
-					//transition into INIT
-					r.state = INIT
+					//transition into stateInit
+					r.state = stateInit
 					r.transitionDoWork(Master2Init)
 					logger.GLoger.Printf(logger.INFO, "event %v received", event)
 					//maybe we can break out the event loop
@@ -456,39 +423,37 @@ func (r *VirtualRouter) eventSelector() {
 				if packet.GetPriority() == 0 {
 					//I don't think we should anything here
 				} else {
-					if packet.GetPriority() > r.priority || (packet.GetPriority() == r.priority && largerThan(packet.Pshdr.Saddr, r.preferredSourceIP)) {
-
+					if packet.GetPriority() > r.priority || (packet.GetPriority() == r.priority && largerThan(packet.Pshdr.Saddr, r.sourceIP)) {
 						//cancel Advertisement timer
 						r.stopAdvertTicker()
 						//set up master down timer
 						r.setMasterAdvInterval(packet.GetAdvertisementInterval())
 						r.makeMasterDownTimer()
-						r.state = BACKUP
+						r.state = stateBackup
 						r.transitionDoWork(Master2Backup)
 					} else {
 						//just discard this one
 					}
 				}
 			}
-
-		case BACKUP:
+		case stateBackup:
 			select {
 			case event := <-r.eventChannel:
-				if event == SHUTDOWN {
+				if event == eventShutdown {
 					//close master down timer
 					r.stopMasterDownTimer()
-					//transition into INIT
-					r.state = INIT
+					//transition into stateInit
+					r.state = stateInit
 					r.transitionDoWork(Backup2Init)
 					logger.GLoger.Printf(logger.INFO, "event %s received", event)
 				}
 			case packet := <-r.packetQueue: //process incoming advertisement
 				if packet.GetPriority() == 0 {
-					logger.GLoger.Printf(logger.INFO, "received an advertisement with priority 0, transit into MASTER state", r.vrID)
+					logger.GLoger.Printf(logger.INFO, "received an advertisement with priority 0, transit into stateMaster state", r.vrID)
 					//Set the Master_Down_Timer to Skew_Time
 					r.resetMasterDownTimerToSkewTime()
 				} else {
-					if r.preempt == false || packet.GetPriority() > r.priority || (packet.GetPriority() == r.priority && largerThan(packet.Pshdr.Saddr, r.preferredSourceIP)) {
+					if r.preempt == false || packet.GetPriority() > r.priority || (packet.GetPriority() == r.priority && largerThan(packet.Pshdr.Saddr, r.sourceIP)) {
 						//reset master down timer
 						r.setMasterAdvInterval(packet.GetAdvertisementInterval())
 						r.resetMasterDownTimer()
@@ -499,15 +464,11 @@ func (r *VirtualRouter) eventSelector() {
 			case <-r.masterDownTimer.C: //Master_Down_Timer fired
 				// Send an ADVERTISEMENT
 				r.sendAdvertMessage()
-				if errOfARP := r.ipAddrAnnouncer.AnnounceAll(r); errOfARP != nil {
-					logger.GLoger.Printf(logger.ERROR, "VirtualRouter.EventLoop: %v", errOfARP)
-				}
 				//Set the Advertisement Timer to Advertisement interval
 				r.makeAdvertTicker()
-				r.state = MASTER
+				r.state = stateMaster
 				r.transitionDoWork(Backup2Master)
 			}
-
 		}
 	}
 }
@@ -515,7 +476,7 @@ func (r *VirtualRouter) eventSelector() {
 func (vr *VirtualRouter) StartWithEventLoop() {
 	go vr.fetchVRRPPacket()
 	go func() {
-		vr.eventChannel <- START
+		vr.eventChannel <- eventStart
 	}()
 	vr.eventLoop()
 }
@@ -523,11 +484,15 @@ func (vr *VirtualRouter) StartWithEventLoop() {
 func (vr *VirtualRouter) StartWithEventSelector() {
 	go vr.fetchVRRPPacket()
 	go func() {
-		vr.eventChannel <- START
+		vr.eventChannel <- eventStart
 	}()
 	vr.eventSelector()
 }
 
 func (vr *VirtualRouter) Stop() {
-	vr.eventChannel <- SHUTDOWN
+	vr.eventChannel <- eventShutdown
+}
+
+func (vr *VirtualRouter) Start() {
+	vr.eventChannel <- eventStart
 }
