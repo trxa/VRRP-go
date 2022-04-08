@@ -489,6 +489,11 @@ func (vr *VirtualRouter) StartWithEventSelector() {
 	vr.eventSelector()
 }
 
+func (vr *VirtualRouter) InitWithEventSelector() {
+	go vr.fetchVRRPPacket()
+	vr.eventSelector()
+}
+
 func (vr *VirtualRouter) Stop() {
 	vr.eventChannel <- eventShutdown
 }
