@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync/atomic"
 	"time"
 
 	"github.com/trxa/VRRP-go/logger"
@@ -18,7 +19,7 @@ type VirtualRouter struct {
 	masterDownInterval            uint16
 	preempt                       bool
 	owner                         bool
-	peers                         []net.IP
+	peers                         peers
 	//
 	sourceIP            net.IP
 	protectedIPaddrs    map[[4]byte]bool
@@ -29,6 +30,18 @@ type VirtualRouter struct {
 	advertisementTicker *time.Ticker
 	masterDownTimer     *time.Timer
 	transitionHandler   map[transition]func()
+}
+
+type peers struct {
+	v atomic.Value
+}
+
+func (p *peers) load() []net.IP {
+	return p.v.Load().([]net.IP)
+}
+
+func (p *peers) store(list []net.IP) {
+	p.v.Store(list)
 }
 
 //NewVirtualRouter create a new virtual router with designated parameters
@@ -60,7 +73,7 @@ func NewVirtualRouter(vrID byte, sip net.IP, owner bool) *VirtualRouter {
 }
 
 func (r *VirtualRouter) SetPeers(peers ...net.IP) *VirtualRouter {
-	r.peers = append([]net.IP(nil), peers...)
+	r.peers.store(peers)
 	return r
 }
 
@@ -126,7 +139,7 @@ func (r *VirtualRouter) sendAdvertMessage() {
 	for k := range r.protectedIPaddrs {
 		logger.GLoger.Printf(logger.DEBUG, "send advert message of IP %v", net.IP(k[:]))
 	}
-	for _, p := range r.peers {
+	for _, p := range r.peers.load() {
 		var x = r.assembleVRRPPacket(p)
 		if errOfWrite := r.iplayerInterface.WriteMessage(x, p); errOfWrite != nil {
 			logger.GLoger.Printf(logger.ERROR, "VirtualRouter.WriteMessage: %v", errOfWrite)
