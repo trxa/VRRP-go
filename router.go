@@ -64,6 +64,7 @@ func NewVirtualRouter(vrID byte, sip net.IP, owner bool) *VirtualRouter {
 	vr.packetQueue = make(chan *VRRPPacket, packetQueueSize)
 	vr.transitionHandler = make(map[transition]func())
 	vr.sourceIP = sip
+	vr.peers.store([]net.IP{})
 
 	//set up IPv4 interface
 	vr.iplayerInterface = newIPv4Conn(vr.sourceIP)
